@@ -1,147 +1,105 @@
+%% Namų elektros vartojimo anomalijų aptikimas
+% Metodai:
+% 1. Moving Average + Z-score
+% 2. One-Class SVM
+% 3. MLP Autoencoder
+
 clear;
 clc;
 close all;
 
-rng(42);
+%% 1. Duomenu nuskaitymas
 
-%% 1. Pagrindiniai parametrai
-
-fileName = "C:\Users\barch\OneDrive\Рабочий стол\github\koliokvium\household_power_consumption.txt";
-
-windowMinutes = 15;
-
-trainRatio = 0.60;
-validationRatio = 0.20;
-
-baselineWindow = 96;
-
-anomalyRate = 0.01;
-
-maxWarningsPerDay = 5;
-
-%% 2. Duomenu nuskaitymas
+filePath = 'C:\Users\barch\OneDrive\Рабочий стол\github\koliokvium\household_power_consumption.txt';
 
 fprintf('Kraunami duomenys...\n');
 
-opts = detectImportOptions( ...
-    fileName, ...
-    'Delimiter', ';');
+opts = detectImportOptions(filePath, ...
+    'Delimiter', ';', ...
+    'DecimalSeparator', '.');
 
-opts = setvaropts( ...
-    opts, ...
-    {'Date','Time'}, ...
-    'Type', 'string');
+T = readtable(filePath, opts);
 
-T = readtable( ...
-    fileName, ...
-    opts);
+fprintf('Pradinis irasu skaicius: %d\n', height(T));
 
-fprintf( ...
-    'Pradinis irasu skaicius: %d\n', ...
-    height(T));
+%% 2. Datos ir laiko sutvarkymas
 
-%% 3. Datos ir laiko sujungimas
+dateText = string(T.Date);
+timeText = string(T.Time);
 
 T.DateTime = datetime( ...
-    T.Date + " " + T.Time, ...
-    'InputFormat', ...
-    'dd/MM/yyyy HH:mm:ss');
+    dateText + " " + timeText, ...
+    'InputFormat', 'dd/MM/yyyy HH:mm:ss');
 
-T.Date = [];
-T.Time = [];
+%% 3. Trukstamu reiksmiu tvarkymas
 
-%% 4. Trukstamu reiksmiu tvarkymas
+fprintf('\nTvarkomos trukstamos reiksmes...\n');
 
-fprintf('Tvarkomos trukstamos reiksmes...\n');
+featureNames = { ...
+    'Global_active_power', ...
+    'Global_reactive_power', ...
+    'Voltage', ...
+    'Global_intensity', ...
+    'Sub_metering_1', ...
+    'Sub_metering_2', ...
+    'Sub_metering_3'};
 
-variables = T.Properties.VariableNames;
+for i = 1:length(featureNames)
 
-for i = 1:length(variables)
+    columnData = T.(featureNames{i});
 
-    name = variables{i};
+    columnData = fillmissing(columnData, 'linear');
+    columnData = fillmissing(columnData, 'previous');
+    columnData = fillmissing(columnData, 'next');
 
-    if ~strcmp(name, 'DateTime')
-
-        T.(name) = fillmissing( ...
-            T.(name), ...
-            'linear');
-
-        T.(name) = fillmissing( ...
-            T.(name), ...
-            'previous');
-
-        T.(name) = fillmissing( ...
-            T.(name), ...
-            'next');
-
-    end
+    T.(featureNames{i}) = columnData;
 
 end
 
-%% 5. Duomenu rikiavimas
+%% 4. Duomenu agregavimas i 15 minuciu intervalus
 
-T = sortrows(T, 'DateTime');
+fprintf('\nAtliekamas 15 minuciu agregavimas...\n');
 
-%% 6. Konvertavimas i timetable
+TT = table2timetable(T);
 
-TT = table2timetable( ...
-    T, ...
-    'RowTimes', ...
-    'DateTime');
+TT15 = retime(TT, 'regular', 'mean', ...
+    'TimeStep', minutes(15));
 
-%% 7. Agregavimas i 15 minuciu langus
+fprintf('Irasu po agregavimo: %d\n', height(TT15));
 
-fprintf( ...
-    'Atliekamas 15 minuciu agregavimas...\n');
+%% 5. Trukstamu reiksmiu tvarkymas po agregavimo
+% Kai kurie 15 minuciu intervalai gali netureti duomenu.
 
-TT15 = retime( ...
-    TT, ...
-    'regular', ...
-    'mean', ...
-    'TimeStep', ...
-    minutes(windowMinutes));
+for i = 1:length(featureNames)
 
-TT15 = rmmissing(TT15);
+    columnData = TT15.(featureNames{i});
 
-fprintf( ...
-    'Irasu po agregavimo: %d\n', ...
-    height(TT15));
+    columnData = fillmissing(columnData, 'linear');
+    columnData = fillmissing(columnData, 'previous');
+    columnData = fillmissing(columnData, 'next');
 
-%% 8. Pagrindiniai pozymiai
+    TT15.(featureNames{i}) = columnData;
 
-activePower = ...
-    TT15.Global_active_power;
+end
 
-reactivePower = ...
-    TT15.Global_reactive_power;
+%% 6. Pozymiu sudarymas
 
-voltage = ...
-    TT15.Voltage;
+activePower = TT15.Global_active_power;
+reactivePower = TT15.Global_reactive_power;
+voltage = TT15.Voltage;
+current = TT15.Global_intensity;
 
-current = ...
-    TT15.Global_intensity;
+sub1 = TT15.Sub_metering_1;
+sub2 = TT15.Sub_metering_2;
+sub3 = TT15.Sub_metering_3;
 
-sub1 = ...
-    TT15.Sub_metering_1;
+% Aktyvios galios slenkantis standartinis nuokrypis
+activeStd = movstd(activePower, [3 0]);
 
-sub2 = ...
-    TT15.Sub_metering_2;
+% Aktyvios galios pokytis
+activeChange = [0; diff(activePower)];
 
-sub3 = ...
-    TT15.Sub_metering_3;
-
-%% 9. Papildomi pozymiai
-
-activeStd = movstd( ...
-    activePower, ...
-    [3 0]);
-
-activeChange = [ ...
-    0; ...
-    diff(activePower)];
-
-%% 10. Pozymiu matrica
-
+% Galutine pozymiu matrica
 X = [ ...
     activePower, ...
     reactivePower, ...
@@ -153,137 +111,245 @@ X = [ ...
     activeStd, ...
     activeChange];
 
-%% 11. Laiko duomenys
+% Galutinis apsauginis NaN tikrinimas
+validRows = all(isfinite(X), 2);
 
-timeData = ...
-    TT15.Properties.RowTimes;
+X = X(validRows,:);
 
-%% 12. Netinkamu reiksmiu salinimas
+fprintf('Galutinis duomenu kiekis: %d\n', size(X,1));
 
-validRows = all( ...
-    isfinite(X), ...
-    2);
-
-X = X(validRows, :);
-
-timeData = ...
-    timeData(validRows);
-
-fprintf( ...
-    'Galutinis duomenu kiekis: %d\n', ...
-    size(X,1));
-
-%% 13. Chronologinis skaidymas
+%% 7. Chronologinis duomenu skaidymas
 
 N = size(X,1);
 
-trainEnd = floor( ...
-    N * trainRatio);
+N_train = floor(0.60 * N);
+N_validation = floor(0.20 * N);
 
-validationEnd = floor( ...
-    N * (trainRatio + validationRatio));
+trainIdx = 1:N_train;
 
-X_train = ...
-    X(1:trainEnd, :);
+validationIdx = ...
+    N_train + 1 : N_train + N_validation;
 
-X_validation = ...
-    X(trainEnd+1:validationEnd, :);
+testIdx = ...
+    N_train + N_validation + 1 : N;
 
-X_test = ...
-    X(validationEnd+1:end, :);
+X_train = X(trainIdx,:);
+X_validation = X(validationIdx,:);
+X_test = X(testIdx,:);
 
-time_test = ...
-    timeData(validationEnd+1:end);
+fprintf('\nDuomenu skaidymas:\n');
+fprintf('Mokymas: %d\n', size(X_train,1));
+fprintf('Validacija: %d\n', size(X_validation,1));
+fprintf('Testas: %d\n', size(X_test,1));
 
-fprintf('\n');
-fprintf('Duomenu skaidymas:\n');
+%% 8. Dirbtiniu anomaliju generavimas
 
-fprintf( ...
-    'Mokymas: %d\n', ...
-    size(X_train,1));
+fprintf('\nGeneruojamos dirbtines anomalijos...\n');
 
-fprintf( ...
-    'Validacija: %d\n', ...
-    size(X_validation,1));
+X_validation_anomaly = X_validation;
+X_test_anomaly = X_test;
 
-fprintf( ...
-    'Testas: %d\n', ...
-    size(X_test,1));
+labels_validation = zeros(size(X_validation,1),1);
+labels_test = zeros(size(X_test,1),1);
 
-%% 14. Dirbtines anomalijos
+% 4 x 15 min = 1 valanda
+anomalyLength = 4;
 
-fprintf('\n');
-fprintf('Generuojamos dirbtines anomalijos...\n');
+% Apie 1 procentas anomaliju
+numValidationAnomalies = ...
+    floor(0.01 * size(X_validation,1) / anomalyLength);
 
-[X_validation_anomaly, labels_validation] = ...
-    injectAnomalies( ...
-    X_validation, ...
-    anomalyRate);
+numTestAnomalies = ...
+    floor(0.01 * size(X_test,1) / anomalyLength);
 
-[X_test_anomaly, labels_test] = ...
-    injectAnomalies( ...
-    X_test, ...
-    anomalyRate);
+rng(42);
 
-fprintf( ...
-    'Validacijos anomaliju: %d\n', ...
-    sum(labels_validation));
+%% 8.1 Validacijos anomalijos
 
-fprintf( ...
-    'Testo anomaliju: %d\n', ...
-    sum(labels_test));
+usedStarts = [];
 
-%% 15. BASELINE
+for k = 1:numValidationAnomalies
 
-fprintf('\n');
-fprintf('========================================\n');
+    while true
+
+        startIdx = randi( ...
+            [1, size(X_validation_anomaly,1) - anomalyLength + 1]);
+
+        if isempty(usedStarts) || ...
+                all(abs(startIdx - usedStarts) >= anomalyLength)
+
+            break;
+
+        end
+
+    end
+
+    usedStarts(end+1) = startIdx;
+
+    idx = startIdx:startIdx + anomalyLength - 1;
+
+    % Padidiname aktyviaja galia
+    X_validation_anomaly(idx,1) = ...
+        X_validation_anomaly(idx,1) * 2.5;
+
+    labels_validation(idx) = 1;
+
+end
+
+%% 8.2 Testo anomalijos
+
+usedStarts = [];
+
+for k = 1:numTestAnomalies
+
+    while true
+
+        startIdx = randi( ...
+            [1, size(X_test_anomaly,1) - anomalyLength + 1]);
+
+        if isempty(usedStarts) || ...
+                all(abs(startIdx - usedStarts) >= anomalyLength)
+
+            break;
+
+        end
+
+    end
+
+    usedStarts(end+1) = startIdx;
+
+    idx = startIdx:startIdx + anomalyLength - 1;
+
+    % Padidiname aktyviaja galia
+    X_test_anomaly(idx,1) = ...
+        X_test_anomaly(idx,1) * 2.5;
+
+    labels_test(idx) = 1;
+
+end
+
+% Perskaiciuojame nuo aktyvios galios priklausancias pozymes
+X_validation_anomaly(:,8) = ...
+    movstd(X_validation_anomaly(:,1), [3 0]);
+
+X_validation_anomaly(:,9) = ...
+    [0; diff(X_validation_anomaly(:,1))];
+
+X_test_anomaly(:,8) = ...
+    movstd(X_test_anomaly(:,1), [3 0]);
+
+X_test_anomaly(:,9) = ...
+    [0; diff(X_test_anomaly(:,1))];
+
+fprintf('Validacijos anomaliju: %d\n', sum(labels_validation));
+fprintf('Testo anomaliju: %d\n', sum(labels_test));
+
+%% 9. BASELINE
+% Moving Average + Z-score
+
+fprintf('\n========================================\n');
 fprintf('BASELINE\n');
 fprintf('Moving Average + Z-score\n');
 fprintf('========================================\n');
 
-baselineValidationScore = ...
-    baselineScore( ...
-    X_validation_anomaly, ...
-    baselineWindow);
+% Mokymo duomenu slenkantis vidurkis
+windowSize = 16;
 
-baselineTestScore = ...
-    baselineScore( ...
-    X_test_anomaly, ...
-    baselineWindow);
+baselineTrainMean = movmean( ...
+    X_train(:,1), [windowSize 0]);
 
-baselineThreshold = ...
-    selectThreshold( ...
-    baselineValidationScore, ...
-    labels_validation, ...
-    maxWarningsPerDay);
+baselineTrainResidual = ...
+    X_train(:,1) - baselineTrainMean;
 
-baselineResult = ...
-    calculateMetrics( ...
-    baselineTestScore, ...
+baselineResidualStd = ...
+    std(baselineTrainResidual);
+
+if baselineResidualStd == 0 || ...
+        ~isfinite(baselineResidualStd)
+
+    baselineResidualStd = 1;
+
+end
+
+% Validacija
+validationMovingMean = movmean( ...
+    X_validation_anomaly(:,1), [windowSize 0]);
+
+validationResidual = ...
+    X_validation_anomaly(:,1) - validationMovingMean;
+
+validationZ = ...
+    abs(validationResidual) / baselineResidualStd;
+
+% Testas
+testMovingMean = movmean( ...
+    X_test_anomaly(:,1), [windowSize 0]);
+
+testResidual = ...
+    X_test_anomaly(:,1) - testMovingMean;
+
+testZ = ...
+    abs(testResidual) / baselineResidualStd;
+
+%% 9.1 Baseline slenkscio pasirinkimas
+
+candidateThresholds = linspace(1,5,200);
+
+bestThreshold = NaN;
+bestScore = -inf;
+
+for i = 1:length(candidateThresholds)
+
+    currentThreshold = candidateThresholds(i);
+
+    metrics = calculateMetrics( ...
+        validationZ, ...
+        labels_validation, ...
+        currentThreshold);
+
+    if metrics.WarningsPerDay <= 5
+
+        if metrics.Recall > bestScore
+
+            bestScore = metrics.Recall;
+            bestThreshold = currentThreshold;
+
+        end
+
+    end
+
+end
+
+% Jei nebuvo tinkamo slenkscio
+if isnan(bestThreshold)
+
+    bestThreshold = 3;
+
+end
+
+baselineThreshold = bestThreshold;
+
+baselineResult = calculateMetrics( ...
+    testZ, ...
     labels_test, ...
     baselineThreshold);
 
-fprintf( ...
-    'Threshold = %.4f\n', ...
-    baselineThreshold);
+fprintf('Threshold = %.4f\n', baselineThreshold);
+fprintf('Recall = %.4f\n', baselineResult.Recall);
+fprintf('Warnings/day = %.2f\n', ...
+    baselineResult.WarningsPerDay);
 
-fprintf( ...
-    'Recall = %.4f\n', ...
-    baselineResult.recall);
+%% 10. Duomenu standartizavimas
 
-fprintf( ...
-    'Warnings/day = %.2f\n', ...
-    baselineResult.warningsPerDay);
+meanTrain = mean(X_train,1);
+stdTrain = std(X_train,[],1);
 
-%% 16. Standartizavimas
-
-meanTrain = ...
-    mean(X_train, 1);
-
-stdTrain = ...
-    std(X_train, 0, 1);
-
+% Apsauga nuo nulio
 stdTrain(stdTrain == 0) = 1;
+
+% Apsauga nuo NaN
+meanTrain(~isfinite(meanTrain)) = 0;
+stdTrain(~isfinite(stdTrain)) = 1;
 
 X_train_s = ...
     (X_train - meanTrain) ./ stdTrain;
@@ -294,33 +360,59 @@ X_validation_s = ...
 X_test_s = ...
     (X_test_anomaly - meanTrain) ./ stdTrain;
 
-%% 17. ONE-CLASS SVM
+%% 10.1 Galutinis NaN tikrinimas
+
+if any(~isfinite(X_train_s(:)))
+
+    error('X_train turi NaN arba Inf reiksmiu.');
+
+end
+
+if any(~isfinite(X_validation_s(:)))
+
+    error('X_validation turi NaN arba Inf reiksmiu.');
+
+end
+
+if any(~isfinite(X_test_s(:)))
+
+    error('X_test turi NaN arba Inf reiksmiu.');
+
+end
+
+fprintf('\nDuomenu standartizavimas baigtas.\n');
+fprintf('NaN/Inf reiksmiu neliko.\n');
+
+%% 11. ONE-CLASS SVM
 % Pagrindinis metodas
 
-fprintf('\n');
-fprintf('========================================\n');
+fprintf('\n========================================\n');
 fprintf('ONE-CLASS SVM\n');
 fprintf('PAGRINDINIS METODAS\n');
 fprintf('========================================\n');
 
-%% 18. Mokymo imties dydis
+maxSVMTrain = 30000;
 
-maxSamples = ...
-    min(30000, size(X_train_s,1));
+rng(42);
 
-randomIndex = ...
-    randperm( ...
-    size(X_train_s,1), ...
-    maxSamples);
+if size(X_train_s,1) > maxSVMTrain
 
-X_svm_train = ...
-    X_train_s(randomIndex, :);
+    svmIdx = randperm( ...
+        size(X_train_s,1), ...
+        maxSVMTrain);
 
-fprintf( ...
-    'SVM mokymui naudojama: %d irasu\n', ...
+    X_svm_train = X_train_s(svmIdx,:);
+
+else
+
+    X_svm_train = X_train_s;
+
+end
+
+fprintf('SVM mokymui naudojama: %d irasu\n', ...
     size(X_svm_train,1));
 
-%% 19. One-Class SVM modelis
+%% 11.1 SVM mokymas
 
 svmModel = fitcsvm( ...
     X_svm_train, ...
@@ -332,902 +424,630 @@ svmModel = fitcsvm( ...
 
 fprintf('One-Class SVM mokymas baigtas.\n');
 
-%% 20. SVM validacija
+%% 11.2 SVM validacija
 
 [~, svmValidationScore] = ...
-    predict( ...
-    svmModel, ...
-    X_validation_s);
-
-% Teigiama reiksme = didesnis anomalijos balas
+    predict(svmModel, X_validation_s);
 
 svmValidationScore = ...
     -svmValidationScore;
 
-%% 21. SVM testas
+%% 11.3 SVM testas
 
 [~, svmTestScore] = ...
-    predict( ...
-    svmModel, ...
-    X_test_s);
+    predict(svmModel, X_test_s);
 
 svmTestScore = ...
     -svmTestScore;
 
-%% 22. SVM threshold
+%% 11.4 SVM slenkscio pasirinkimas
 
-svmThreshold = ...
-    selectThreshold( ...
-    svmValidationScore, ...
-    labels_validation, ...
-    maxWarningsPerDay);
+candidateThresholds = linspace( ...
+    min(svmValidationScore), ...
+    max(svmValidationScore), ...
+    200);
 
-svmResult = ...
-    calculateMetrics( ...
+bestThreshold = NaN;
+bestScore = -inf;
+
+for i = 1:length(candidateThresholds)
+
+    currentThreshold = candidateThresholds(i);
+
+    metrics = calculateMetrics( ...
+        svmValidationScore, ...
+        labels_validation, ...
+        currentThreshold);
+
+    if metrics.WarningsPerDay <= 5
+
+        if metrics.Recall > bestScore
+
+            bestScore = metrics.Recall;
+            bestThreshold = currentThreshold;
+
+        end
+
+    end
+
+end
+
+if isnan(bestThreshold)
+
+    bestThreshold = ...
+        prctile(svmValidationScore,99);
+
+end
+
+svmThreshold = bestThreshold;
+
+svmResult = calculateMetrics( ...
     svmTestScore, ...
     labels_test, ...
     svmThreshold);
 
-fprintf( ...
-    'Threshold = %.4f\n', ...
-    svmThreshold);
+fprintf('Threshold = %.4f\n', svmThreshold);
+fprintf('Recall = %.4f\n', svmResult.Recall);
+fprintf('Warnings/day = %.2f\n', ...
+    svmResult.WarningsPerDay);
 
-fprintf( ...
-    'Recall = %.4f\n', ...
-    svmResult.recall);
+%% 12. MLP AUTOENCODER
 
-fprintf( ...
-    'Warnings/day = %.2f\n', ...
-    svmResult.warningsPerDay);
-
-%% 23. MLP AUTOENCODER
-
-fprintf('\n');
-fprintf('========================================\n');
+fprintf('\n========================================\n');
 fprintf('MLP AUTOENCODER\n');
 fprintf('========================================\n');
 
-inputSize = ...
-    size(X_train_s,2);
+fprintf('Architektura: 9-8-3-8-9\n');
 
+inputSize = 9;
 hidden1Size = 8;
 hidden2Size = 3;
 hidden3Size = 8;
 
-fprintf( ...
-    'Architektura: %d-%d-%d-%d-%d\n', ...
-    inputSize, ...
-    hidden1Size, ...
-    hidden2Size, ...
-    hidden3Size, ...
-    inputSize);
+rng(42);
 
-%% 24. Pradiniai svoriai
+% Pradiniai svoriai
+W1 = randn(inputSize, hidden1Size) * 0.1;
+b1 = zeros(1, hidden1Size);
 
-W1 = ...
-    randn( ...
-    hidden1Size, ...
-    inputSize) * 0.05;
+W2 = randn(hidden1Size, hidden2Size) * 0.1;
+b2 = zeros(1, hidden2Size);
 
-b1 = ...
-    zeros(hidden1Size,1);
+W3 = randn(hidden2Size, hidden3Size) * 0.1;
+b3 = zeros(1, hidden3Size);
 
-W2 = ...
-    randn( ...
-    hidden2Size, ...
-    hidden1Size) * 0.05;
-
-b2 = ...
-    zeros(hidden2Size,1);
-
-W3 = ...
-    randn( ...
-    hidden3Size, ...
-    hidden2Size) * 0.05;
-
-b3 = ...
-    zeros(hidden3Size,1);
-
-W4 = ...
-    randn( ...
-    inputSize, ...
-    hidden3Size) * 0.05;
-
-b4 = ...
-    zeros(inputSize,1);
-
-%% 25. MLP parametrai
+W4 = randn(hidden3Size, inputSize) * 0.1;
+b4 = zeros(1, inputSize);
 
 eta = 0.01;
+iterations = 30;
 
-mlpIterations = 30;
-
-Ntrain = ...
-    size(X_train_s,1);
-
-fprintf( ...
-    'Mokymo iteraciju: %d\n', ...
-    mlpIterations);
-
-%% 26. MLP mokymas
-
+fprintf('Mokymo iteraciju: %d\n', iterations);
 fprintf('Mokomas autoencoder...\n');
 
-for iteration = 1:mlpIterations
+%% 12.1 Autoenkoderio mokymas
+
+for iteration = 1:iterations
 
     totalError = 0;
 
-    order = randperm(Ntrain);
+    for n = 1:size(X_train_s,1)
 
-    for k = 1:Ntrain
+        x = X_train_s(n,:);
 
-        n = order(k);
+        %% Forward propagation
 
-        x = ...
-            X_train_s(n,:)';
+        v1 = x * W1 + b1;
+        y1 = 1 ./ (1 + exp(-v1));
 
-        %% Pirmas sluoksnis
+        v2 = y1 * W2 + b2;
+        y2 = 1 ./ (1 + exp(-v2));
 
-        v1 = ...
-            W1 * x + b1;
+        v3 = y2 * W3 + b3;
+        y3 = 1 ./ (1 + exp(-v3));
 
-        y1 = ...
-            sigmoid(v1);
-
-        %% Antras sluoksnis
-
-        v2 = ...
-            W2 * y1 + b2;
-
-        y2 = ...
-            sigmoid(v2);
-
-        %% Trečias sluoksnis
-
-        v3 = ...
-            W3 * y2 + b3;
-
-        y3 = ...
-            sigmoid(v3);
-
-        %% Isejimo sluoksnis
-
-        y = ...
-            W4 * y3 + b4;
+        v4 = y3 * W4 + b4;
+        y4 = v4;
 
         %% Klaida
 
-        e = ...
-            x - y;
+        e = x - y4;
 
         totalError = ...
-            totalError + ...
-            mean(e.^2);
+            totalError + mean(e.^2);
 
         %% Backpropagation
 
         delta4 = e;
 
         delta3 = ...
-            y3 .* (1 - y3) .* ...
-            (W4' * delta4);
+            (y3 .* (1-y3)) .* ...
+            (delta4 * W4');
 
         delta2 = ...
-            y2 .* (1 - y2) .* ...
-            (W3' * delta3);
+            (y2 .* (1-y2)) .* ...
+            (delta3 * W3');
 
         delta1 = ...
-            y1 .* (1 - y1) .* ...
-            (W2' * delta2);
+            (y1 .* (1-y1)) .* ...
+            (delta2 * W2');
 
         %% Svoriu atnaujinimas
 
         W4 = ...
-            W4 + ...
-            eta * delta4 * y3';
+            W4 + eta * (y3' * delta4);
 
         b4 = ...
-            b4 + ...
-            eta * delta4;
+            b4 + eta * delta4;
 
         W3 = ...
-            W3 + ...
-            eta * delta3 * y2';
+            W3 + eta * (y2' * delta3);
 
         b3 = ...
-            b3 + ...
-            eta * delta3;
+            b3 + eta * delta3;
 
         W2 = ...
-            W2 + ...
-            eta * delta2 * y1';
+            W2 + eta * (y1' * delta2);
 
         b2 = ...
-            b2 + ...
-            eta * delta2;
+            b2 + eta * delta2;
 
         W1 = ...
-            W1 + ...
-            eta * delta1 * x';
+            W1 + eta * (x' * delta1);
 
         b1 = ...
-            b1 + ...
-            eta * delta1;
+            b1 + eta * delta1;
 
     end
 
-    averageError = ...
-        totalError / Ntrain;
+    totalError = ...
+        totalError / size(X_train_s,1);
 
     fprintf( ...
         'Iteracija %d/%d, klaida = %.6f\n', ...
         iteration, ...
-        mlpIterations, ...
-        averageError);
+        iterations, ...
+        totalError);
 
 end
 
 fprintf('Autoencoder mokymas baigtas.\n');
 
-%% 27. Autoencoder validacija
+%% 12.2 Autoenkoderio validacija
 
-Nvalidation = ...
-    size(X_validation_s,1);
+validationAE = ...
+    zeros(size(X_validation_s,1),1);
 
-aeValidationScore = ...
-    zeros(Nvalidation,1);
+for n = 1:size(X_validation_s,1)
 
-for n = 1:Nvalidation
+    x = X_validation_s(n,:);
 
-    x = ...
-        X_validation_s(n,:)';
+    y1 = ...
+        1 ./ (1 + exp(-(x * W1 + b1)));
 
-    v1 = W1 * x + b1;
-    y1 = sigmoid(v1);
+    y2 = ...
+        1 ./ (1 + exp(-(y1 * W2 + b2)));
 
-    v2 = W2 * y1 + b2;
-    y2 = sigmoid(v2);
+    y3 = ...
+        1 ./ (1 + exp(-(y2 * W3 + b3)));
 
-    v3 = W3 * y2 + b3;
-    y3 = sigmoid(v3);
+    output = ...
+        y3 * W4 + b4;
 
-    y = W4 * y3 + b4;
-
-    e = x - y;
-
-    aeValidationScore(n) = ...
-        mean(e.^2);
+    validationAE(n) = ...
+        mean((x - output).^2);
 
 end
 
-%% 28. Autoencoder testas
+%% 12.3 Autoenkoderio testas
 
-Ntest = ...
-    size(X_test_s,1);
+testAE = ...
+    zeros(size(X_test_s,1),1);
 
-aeTestScore = ...
-    zeros(Ntest,1);
+for n = 1:size(X_test_s,1)
 
-for n = 1:Ntest
+    x = X_test_s(n,:);
 
-    x = ...
-        X_test_s(n,:)';
+    y1 = ...
+        1 ./ (1 + exp(-(x * W1 + b1)));
 
-    v1 = W1 * x + b1;
-    y1 = sigmoid(v1);
+    y2 = ...
+        1 ./ (1 + exp(-(y1 * W2 + b2)));
 
-    v2 = W2 * y1 + b2;
-    y2 = sigmoid(v2);
+    y3 = ...
+        1 ./ (1 + exp(-(y2 * W3 + b3)));
 
-    v3 = W3 * y2 + b3;
-    y3 = sigmoid(v3);
+    output = ...
+        y3 * W4 + b4;
 
-    y = W4 * y3 + b4;
-
-    e = x - y;
-
-    aeTestScore(n) = ...
-        mean(e.^2);
+    testAE(n) = ...
+        mean((x - output).^2);
 
 end
 
-%% 29. Autoencoder threshold
+%% 12.4 Autoenkoderio slenkscio pasirinkimas
 
-aeThreshold = ...
-    selectThreshold( ...
-    aeValidationScore, ...
-    labels_validation, ...
-    maxWarningsPerDay);
+candidateThresholds = linspace( ...
+    min(validationAE), ...
+    max(validationAE), ...
+    200);
 
-aeResult = ...
-    calculateMetrics( ...
-    aeTestScore, ...
+bestThreshold = NaN;
+bestScore = -inf;
+
+for i = 1:length(candidateThresholds)
+
+    currentThreshold = candidateThresholds(i);
+
+    metrics = calculateMetrics( ...
+        validationAE, ...
+        labels_validation, ...
+        currentThreshold);
+
+    if metrics.WarningsPerDay <= 5
+
+        if metrics.Recall > bestScore
+
+            bestScore = metrics.Recall;
+            bestThreshold = currentThreshold;
+
+        end
+
+    end
+
+end
+
+if isnan(bestThreshold)
+
+    bestThreshold = ...
+        prctile(validationAE,99);
+
+end
+
+aeThreshold = bestThreshold;
+
+aeResult = calculateMetrics( ...
+    testAE, ...
     labels_test, ...
     aeThreshold);
 
-fprintf( ...
-    'Threshold = %.6f\n', ...
-    aeThreshold);
+fprintf('Threshold = %.6f\n', aeThreshold);
+fprintf('Recall = %.4f\n', aeResult.Recall);
+fprintf('Warnings/day = %.2f\n', ...
+    aeResult.WarningsPerDay);
 
-fprintf( ...
-    'Recall = %.4f\n', ...
-    aeResult.recall);
+%% 13. GALUTINIAI REZULTATAI
 
-fprintf( ...
-    'Warnings/day = %.2f\n', ...
-    aeResult.warningsPerDay);
+fprintf('\n========================================\n');
+fprintf('GALUTINIAI REZULTATAI\n');
+fprintf('========================================\n');
 
-%% 30. Stabilumas
+Method = { ...
+    'Moving Average + Z-score'; ...
+    'One-Class SVM'; ...
+    'MLP Autoencoder'};
 
-baselineStability = ...
-    calculateStability( ...
-    baselineTestScore, ...
-    baselineThreshold);
+Recall = [ ...
+    baselineResult.Recall; ...
+    svmResult.Recall; ...
+    aeResult.Recall];
 
-svmStability = ...
-    calculateStability( ...
-    svmTestScore, ...
-    svmThreshold);
+WarningsPerDay = [ ...
+    baselineResult.WarningsPerDay; ...
+    svmResult.WarningsPerDay; ...
+    aeResult.WarningsPerDay];
 
-aeStability = ...
-    calculateStability( ...
-    aeTestScore, ...
-    aeThreshold);
+Stability = [ ...
+    baselineResult.Stability; ...
+    svmResult.Stability; ...
+    aeResult.Stability];
 
-%% 31. Galutine rezultatu lentele
-
-Method = [
-    "Moving Average + Z-score";
-    "One-Class SVM";
-    "MLP Autoencoder"
-    ];
-
-Recall = [
-    baselineResult.recall;
-    svmResult.recall;
-    aeResult.recall
-    ];
-
-WarningsPerDay = [
-    baselineResult.warningsPerDay;
-    svmResult.warningsPerDay;
-    aeResult.warningsPerDay
-    ];
-
-Stability = [
-    baselineStability;
-    svmStability;
-    aeStability
-    ];
-
-Results = table( ...
+resultsTable = table( ...
     Method, ...
     Recall, ...
     WarningsPerDay, ...
     Stability);
 
-%% 32. Rezultatai
-
-fprintf('\n');
-fprintf('========================================\n');
-fprintf('GALUTINIAI REZULTATAI\n');
-fprintf('========================================\n');
-
-disp(Results);
-
-%% 33. Rezultatu issaugojimas
+disp(resultsTable);
 
 writetable( ...
-    Results, ...
+    resultsTable, ...
     'rezultatai.csv');
 
-fprintf( ...
-    'Rezultatai issaugoti i rezultatai.csv\n');
+fprintf('\nRezultatai issaugoti i rezultatai.csv\n');
 
-%% 34. Baseline grafikas
+%% 14. ABLACIJA
+% SVM tik su Global Active Power
 
-figure;
-
-plot( ...
-    time_test, ...
-    baselineTestScore);
-
-hold on;
-
-yline( ...
-    baselineThreshold, ...
-    '--');
-
-xlabel('Laikas');
-
-ylabel('Z-score');
-
-title( ...
-    'Moving Average + Z-score');
-
-grid on;
-
-%% 35. One-Class SVM grafikas
-
-figure;
-
-plot( ...
-    time_test, ...
-    svmTestScore);
-
-hold on;
-
-yline( ...
-    svmThreshold, ...
-    '--');
-
-xlabel('Laikas');
-
-ylabel('Anomalijos balas');
-
-title( ...
-    'One-Class SVM');
-
-grid on;
-
-%% 36. Autoencoder grafikas
-
-figure;
-
-plot( ...
-    time_test, ...
-    aeTestScore);
-
-hold on;
-
-yline( ...
-    aeThreshold, ...
-    '--');
-
-xlabel('Laikas');
-
-ylabel( ...
-    'Rekonstrukcijos paklaida');
-
-title( ...
-    'MLP Autoencoder');
-
-grid on;
-
-%% 37. Dirbtines anomalijos
-
-figure;
-
-plot( ...
-    time_test, ...
-    X_test(:,1));
-
-hold on;
-
-anomalyIndex = ...
-    labels_test == 1;
-
-plot( ...
-    time_test(anomalyIndex), ...
-    X_test(anomalyIndex,1), ...
-    'rx');
-
-xlabel('Laikas');
-
-ylabel('Global Active Power');
-
-title( ...
-    'Testo duomenys ir dirbtines anomalijos');
-
-legend( ...
-    'Elektros vartojimas', ...
-    'Dirbtine anomalija');
-
-grid on;
-
-%% 38. ABLACIJA
-% Pagrindinis metodas naudojant tik Global Active Power
-
-fprintf('\n');
-fprintf('========================================\n');
+fprintf('\n========================================\n');
 fprintf('ABLACIJA\n');
 fprintf('========================================\n');
 
-X_train_ab = ...
-    X_train(:,1);
+X_train_one = X_train(:,1);
+X_validation_one = X_validation_anomaly(:,1);
+X_test_one = X_test_anomaly(:,1);
 
-X_validation_ab = ...
-    X_validation_anomaly(:,1);
+oneMean = mean(X_train_one);
+oneStd = std(X_train_one);
 
-X_test_ab = ...
-    X_test_anomaly(:,1);
+if oneStd == 0 || ~isfinite(oneStd)
 
-meanAb = ...
-    mean(X_train_ab);
+    oneStd = 1;
 
-stdAb = ...
-    std(X_train_ab);
-
-if stdAb == 0
-    stdAb = 1;
 end
 
-X_train_ab = ...
-    (X_train_ab - meanAb) ./ stdAb;
+X_train_one_s = ...
+    (X_train_one - oneMean) / oneStd;
 
-X_validation_ab = ...
-    (X_validation_ab - meanAb) ./ stdAb;
+X_validation_one_s = ...
+    (X_validation_one - oneMean) / oneStd;
 
-X_test_ab = ...
-    (X_test_ab - meanAb) ./ stdAb;
+X_test_one_s = ...
+    (X_test_one - oneMean) / oneStd;
 
-%% 39. One-Class SVM su vienu pozymiu
+maxSVMTrain = 30000;
 
-svmAb = fitcsvm( ...
-    X_train_ab, ...
-    ones(size(X_train_ab,1),1), ...
+rng(42);
+
+if size(X_train_one_s,1) > maxSVMTrain
+
+    svmIdx = randperm( ...
+        size(X_train_one_s,1), ...
+        maxSVMTrain);
+
+    X_one_train = ...
+        X_train_one_s(svmIdx);
+
+else
+
+    X_one_train = X_train_one_s;
+
+end
+
+svmOneFeature = fitcsvm( ...
+    X_one_train, ...
+    ones(size(X_one_train,1),1), ...
     'KernelFunction', 'rbf', ...
     'KernelScale', 'auto', ...
     'OutlierFraction', 0.01, ...
     'Standardize', false);
 
-[~, abValidationScore] = ...
-    predict( ...
-    svmAb, ...
-    X_validation_ab);
+[~, oneValidationScore] = ...
+    predict(svmOneFeature, X_validation_one_s);
 
-abValidationScore = ...
-    -abValidationScore;
+oneValidationScore = ...
+    -oneValidationScore;
 
-abThreshold = ...
-    selectThreshold( ...
-    abValidationScore, ...
-    labels_validation, ...
-    maxWarningsPerDay);
+[~, oneTestScore] = ...
+    predict(svmOneFeature, X_test_one_s);
 
-[~, abTestScore] = ...
-    predict( ...
-    svmAb, ...
-    X_test_ab);
+oneTestScore = ...
+    -oneTestScore;
 
-abTestScore = ...
-    -abTestScore;
+candidateThresholds = linspace( ...
+    min(oneValidationScore), ...
+    max(oneValidationScore), ...
+    200);
 
-abResult = ...
-    calculateMetrics( ...
-    abTestScore, ...
+bestThreshold = NaN;
+bestScore = -inf;
+
+for i = 1:length(candidateThresholds)
+
+    currentThreshold = candidateThresholds(i);
+
+    metrics = calculateMetrics( ...
+        oneValidationScore, ...
+        labels_validation, ...
+        currentThreshold);
+
+    if metrics.WarningsPerDay <= 5
+
+        if metrics.Recall > bestScore
+
+            bestScore = metrics.Recall;
+            bestThreshold = currentThreshold;
+
+        end
+
+    end
+
+end
+
+if isnan(bestThreshold)
+
+    bestThreshold = ...
+        prctile(oneValidationScore,99);
+
+end
+
+oneFeatureThreshold = bestThreshold;
+
+oneFeatureResult = calculateMetrics( ...
+    oneTestScore, ...
     labels_test, ...
-    abThreshold);
+    oneFeatureThreshold);
 
-fprintf( ...
-    'SVM tik su Global Active Power:\n');
+fprintf('SVM tik su Global Active Power:\n');
+fprintf('Recall = %.4f\n', ...
+    oneFeatureResult.Recall);
 
-fprintf( ...
-    'Recall = %.4f\n', ...
-    abResult.recall);
+fprintf('Warnings/day = %.2f\n', ...
+    oneFeatureResult.WarningsPerDay);
 
-fprintf( ...
-    'Warnings/day = %.2f\n', ...
-    abResult.warningsPerDay);
+%% 15. ATSPARUMO TESTAS
 
-%% 40. ATSparumo TESTAS
-
-fprintf('\n');
-fprintf('========================================\n');
+fprintf('\n========================================\n');
 fprintf('ATSPARUMO TESTAS\n');
 fprintf('========================================\n');
 
 noiseLevel = 0.05;
 
-noise = ...
-    noiseLevel * randn(size(X_test));
+rng(100);
 
-X_test_noisy = ...
-    X_test .* ...
-    (1 + noiseLevel * randn(size(X_test)));
+X_test_noisy = X_test_anomaly;
 
+% Santykinis triuksmas aktyviajai galiai
+activePowerNoise = ...
+    noiseLevel * randn(size(X_test_noisy(:,1)));
+
+X_test_noisy(:,1) = ...
+    X_test_noisy(:,1) .* ...
+    (1 + activePowerNoise);
+
+% Negalime tureti neigiamos galios
+X_test_noisy(:,1) = ...
+    max(X_test_noisy(:,1),0);
+
+% Perskaiciuojame priklausomas pozymes
+X_test_noisy(:,8) = ...
+    movstd(X_test_noisy(:,1), [3 0]);
+
+X_test_noisy(:,9) = ...
+    [0; diff(X_test_noisy(:,1))];
+
+% Standartizavimas
 X_test_noisy_s = ...
-    (X_test_noisy - meanTrain) ...
-    ./ stdTrain;
+    (X_test_noisy - meanTrain) ./ stdTrain;
 
+% SVM prognoze
 [~, noisyScore] = ...
-    predict( ...
-    svmModel, ...
-    X_test_noisy_s);
+    predict(svmModel, X_test_noisy_s);
 
 noisyScore = ...
     -noisyScore;
 
-noisyResult = ...
-    calculateMetrics( ...
+noisyResult = calculateMetrics( ...
     noisyScore, ...
     labels_test, ...
     svmThreshold);
 
-fprintf( ...
-    'Triuksmo lygis = %.2f\n', ...
-    noiseLevel);
+fprintf('Triuksmo lygis = %.2f\n', noiseLevel);
+fprintf('Recall su triuksmu = %.4f\n', ...
+    noisyResult.Recall);
 
-fprintf( ...
-    'Recall su triuksmu = %.4f\n', ...
-    noisyResult.recall);
+fprintf('Warnings/day su triuksmu = %.2f\n', ...
+    noisyResult.WarningsPerDay);
 
-fprintf( ...
-    'Warnings/day su triuksmu = %.2f\n', ...
-    noisyResult.warningsPerDay);
+%% 15.1 Sprendimo stabilumas
 
-%% 41. Baigta
+normalDecision = ...
+    svmTestScore > svmThreshold;
 
-fprintf('\n');
-fprintf('========================================\n');
+noisyDecision = ...
+    noisyScore > svmThreshold;
+
+decisionChangeRate = ...
+    mean(normalDecision ~= noisyDecision);
+
+fprintf('Sprendimo pokycio dalis = %.4f\n', ...
+    decisionChangeRate);
+
+%% 16. Grafikas: SVM aptiktos anomalijos
+
+figure;
+
+plot( ...
+    X_test_anomaly(:,1), ...
+    'LineWidth', 1);
+
+hold on;
+
+anomalyIdx = ...
+    find(svmTestScore > svmThreshold);
+
+plot( ...
+    anomalyIdx, ...
+    X_test_anomaly(anomalyIdx,1), ...
+    'rx');
+
+xlabel('Laiko intervalas');
+ylabel('Global Active Power');
+
+title('SVM aptiktos anomalijos');
+
+legend( ...
+    'Aktyvioji galia', ...
+    'Aptiktos anomalijos');
+
+grid on;
+
+%% 17. Grafikas: Recall palyginimas
+
+figure;
+
+bar(Recall);
+
+set(gca, ...
+    'XTickLabel', Method);
+
+ylabel('Recall');
+
+title('Anomaliju aptikimo Recall');
+
+grid on;
+
+%% 18. Grafikas: ispejimai per diena
+
+figure;
+
+bar(WarningsPerDay);
+
+set(gca, ...
+    'XTickLabel', Method);
+
+ylabel('Ispejimai per diena');
+
+title('Ispejimu skaicius per diena');
+
+grid on;
+
+fprintf('\n========================================\n');
 fprintf('ANALIZE BAIGTA\n');
 fprintf('========================================\n');
 
 
-%% FUNKCIJOS
+%% FUNKCIJA: METRIKOS
 
-
-function y = sigmoid(x)
-
-    x = max(min(x,50),-50);
-
-    y = ...
-        1 ./ (1 + exp(-x));
-
-end
-
-
-function score = baselineScore(X,W)
-
-    signal = X(:,1);
-
-    movingMean = ...
-        movmean( ...
-        signal, ...
-        [W 0], ...
-        'Endpoints', ...
-        'shrink');
-
-    movingStd = ...
-        movstd( ...
-        signal, ...
-        [W 0], ...
-        'Endpoints', ...
-        'shrink');
-
-    score = ...
-        abs(signal - movingMean) ...
-        ./ (movingStd + 1e-8);
-
-end
-
-
-function score = selectScoreDummy()
-    score = [];
-end
-
-
-function threshold = selectThreshold( ...
-    scores, ...
-    labels, ...
-    maxWarningsPerDay)
-
-    sortedScores = ...
-        sort(scores);
-
-    N = ...
-        length(sortedScores);
-
-    numberOfCandidates = ...
-        min(300,N);
-
-    candidateIndex = ...
-        round(linspace( ...
-        1,N,numberOfCandidates));
-
-    candidateIndex = ...
-        unique(candidateIndex);
-
-    thresholds = ...
-        sortedScores(candidateIndex);
-
-    bestRecall = -1;
-
-    threshold = ...
-        thresholds(end);
-
-    for i = 1:length(thresholds)
-
-        currentThreshold = ...
-            thresholds(i);
-
-        prediction = ...
-            scores >= currentThreshold;
-
-        warningsPerDay = ...
-            sum(prediction) ...
-            / length(prediction) * 96;
-
-        if warningsPerDay <= ...
-                maxWarningsPerDay
-
-            TP = sum( ...
-                prediction == 1 & ...
-                labels == 1);
-
-            FN = sum( ...
-                prediction == 0 & ...
-                labels == 1);
-
-            if TP + FN > 0
-
-                recall = ...
-                    TP / ...
-                    (TP + FN);
-
-            else
-
-                recall = 0;
-
-            end
-
-            if recall > bestRecall
-
-                bestRecall = recall;
-
-                threshold = ...
-                    currentThreshold;
-
-            end
-
-        end
-
-    end
-
-end
-
-
-function metrics = calculateMetrics( ...
+function result = calculateMetrics( ...
     scores, ...
     labels, ...
     threshold)
 
-    prediction = ...
-        scores >= threshold;
+    predicted = ...
+        scores > threshold;
 
     TP = sum( ...
-        prediction == 1 & ...
-        labels == 1);
+        predicted == 1 & labels == 1);
 
     FN = sum( ...
-        prediction == 0 & ...
-        labels == 1);
+        predicted == 0 & labels == 1);
 
-    if TP + FN > 0
-
-        recall = ...
-            TP / ...
-            (TP + FN);
-
-    else
+    if (TP + FN) == 0
 
         recall = 0;
 
+    else
+
+        recall = ...
+            TP / (TP + FN);
+
     end
 
-    numberOfDays = ...
-        length(scores) / 96;
+    % 15 minuciu intervalai
+    intervalsPerDay = 24 * 4;
 
     warningsPerDay = ...
-        sum(prediction) / ...
-        numberOfDays;
+        sum(predicted) / ...
+        length(predicted) * ...
+        intervalsPerDay;
 
-    metrics.recall = ...
-        recall;
-
-    metrics.warningsPerDay = ...
-        warningsPerDay;
-
-    metrics.warnings = ...
-        sum(prediction);
-
-end
-
-
-function stability = calculateStability( ...
-    scores, ...
-    threshold)
-
-    prediction = ...
-        scores >= threshold;
-
-    samplesPerDay = 96;
-
-    numberOfDays = ...
-        floor(length(prediction) / ...
-        samplesPerDay);
-
-    if numberOfDays < 2
-
-        stability = 0;
-
-        return;
-
-    end
-
-    dailyWarnings = ...
-        zeros(numberOfDays,1);
-
-    for i = 1:numberOfDays
-
-        firstIndex = ...
-            (i-1) * samplesPerDay + 1;
-
-        lastIndex = ...
-            i * samplesPerDay;
-
-        dailyWarnings(i) = ...
-            sum(prediction( ...
-            firstIndex:lastIndex));
-
-    end
-
+    % Paprastas stabilumo rodiklis
     stability = ...
-        std(dailyWarnings);
+        1 / (1 + warningsPerDay);
 
-end
-
-
-function [X_new,labels] = ...
-    injectAnomalies(X,rate)
-
-    X_new = X;
-
-    N = ...
-        size(X,1);
-
-    anomalyCount = ...
-        max(1,floor(N * rate));
-
-    indices = ...
-        randperm(N,anomalyCount);
-
-    labels = ...
-        zeros(N,1);
-
-    for i = 1:length(indices)
-
-        index = ...
-            indices(i);
-
-        anomalyType = ...
-            mod(i-1,3);
-
-        if anomalyType == 0
-
-            % Didelis vartojimo padidejimas
-
-            X_new(index,1) = ...
-                X_new(index,1) * 3;
-
-        elseif anomalyType == 1
-
-            % Didelis vartojimo sumazejimas
-
-            X_new(index,1) = ...
-                X_new(index,1) * 0.1;
-
-        else
-
-            % Vidutinis vartojimo pokytis
-
-            X_new(index,1) = ...
-                X_new(index,1) * 1.8;
-
-        end
-
-        labels(index) = 1;
-
-    end
+    result.Recall = recall;
+    result.WarningsPerDay = warningsPerDay;
+    result.Stability = stability;
 
 end
